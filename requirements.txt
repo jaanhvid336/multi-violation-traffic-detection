@@ -1,0 +1,10 @@
+streamlit
+opencv-python
+ultralytics
+easyocr
+pandas
+matplotlib
+seaborn
+folium
+openpyxl
+huggingface_hub
