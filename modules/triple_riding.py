@@ -362,7 +362,8 @@ def draw_normal_motorcycles(frame, associations: list, suppress_ids: set):
 
         x1, y1, x2, y2 = mc["bbox"]
         rider_count = len(assoc["riders"])
-        label = f"Normal ({rider_count})"
+        # CHANGED: Use dynamic rider_count instead of hardcoded "(1)"
+        label = f"Normal ({rider_count})" 
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
         cv2.putText(frame, label, (x1, y1 - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 0), 2)

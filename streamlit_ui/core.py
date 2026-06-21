@@ -221,6 +221,15 @@ def process_video(video_path, video_placeholder, on_counts,
                 if rtid >= 0:
                     person_moto[rtid] = mc_d
 
+        # Track the FIRST (main/driver) rider for each motorcycle
+        main_rider_ids = set()
+        for a in associations:
+            riders = a.get("riders", [])
+            if riders:  # Get the first rider (driver)
+                first_rider_id = riders[0].get("track_id", -1)
+                if first_rider_id >= 0:
+                    main_rider_ids.add(first_rider_id)
+
         def do_plate_read(row_index, bbox):
             """Read the plate from the clean frame and back-fill the row."""
             if clean_frame is None or bbox is None:
@@ -252,23 +261,18 @@ def process_video(video_path, video_placeholder, on_counts,
                     frame = draw_normal_motorcycles(frame, [payload], set())
 
         # ── Helmet ──────────────────────────────────────────────
-        # Run on EVERY detected person, not only riders matched to a bike.
-        # Bikes are frequently missed (rear views, occlusion), and gating the
-        # helmet check behind motorcycle association meant whole videos got no
-        # helmet detection at all. Dedupe persons so one rider isn't checked
-        # (and flagged) several times from overlapping boxes.
+        # Run ONLY on the main rider (driver) of each motorcycle.
+        # Do NOT check passengers (riders 2+).
         if detect_helmet:
-            # Run helmet only on EVEN detection cycles (cache redraws between),
-            # and only on the largest riders, to bound cost on busy frames.
+            # Run helmet only on EVEN detection cycles (cache redraws between)
+            # to bound cost on busy frames.
             helmet_now = detect_now and (frame_count // detection_skip_frames) % 2 == 0
             if helmet_now:
                 helmet_cache = []
-                persons = _dedupe_persons(
-                    [d for d in detections if d["class"] == "person"])
-                persons = sorted(
-                    persons, key=lambda p: p["bbox"][3] - p["bbox"][1],
-                    reverse=True)[:6]
-                for person in persons:
+                # Only check MAIN riders (drivers), not passengers
+                main_rider_persons = [d for d in detections 
+                                     if d["class"] == "person" and d.get("track_id", -1) in main_rider_ids]
+                for person in main_rider_persons:
                     px1, py1, px2, py2 = map(int, person["bbox"])
                     if (py2 - py1) < 90:
                         continue
@@ -289,15 +293,11 @@ def process_video(video_path, video_placeholder, on_counts,
                                              location=location)
                         if ridx is not None:
                             counts["No Helmet"] += 1
-                            # Prefer the rider's motorcycle (plate lives there).
+                            # Use the rider's motorcycle for plate lookup
                             mc_d = person_moto.get(pid)
                             if mc_d is not None and mc_d.get("track_id", -1) >= 0:
                                 register_plate_job(ridx, mc_d["track_id"], "moto")
                                 do_plate_read(ridx, mc_d["bbox"])
-                            else:
-                                register_plate_job(ridx, pid, "person")
-                                ex = (px1, py1, px2, int(py2 + (py2 - py1) * 0.45))
-                                do_plate_read(ridx, ex)
             for hx1, hy1, hx2, hy2, has_helmet in helmet_cache:
                 color = (0, 200, 0) if has_helmet else (0, 0, 255)
                 label = "Helmet" if has_helmet else "No Helmet"
@@ -398,9 +398,7 @@ def process_video(video_path, video_placeholder, on_counts,
 def process_image(image_bgr, detect_triple, detect_helmet, detect_signal,
                   detect_plate, location):
     """
-    Run detection on a SINGLE image. Returns (annotated_rgb, results) where
-    results is a list of {violation, plate, riders, timestamp} dicts. Each
-    violation is logged once with its plate (same DB as the video pipeline).
+    Run detection on a SINGLE image with helmet detection only on main rider (driver).
     """
     detector, helmet_det, plate_detector, ocr_history = load_models()
     reset_run_state()
@@ -408,10 +406,10 @@ def process_image(image_bgr, detect_triple, detect_helmet, detect_signal,
 
     frame = image_bgr.copy()
     clean = image_bgr.copy()
-    # persist=False -> treat the image independently (no tracker carry-over)
     frame, detections = detector.process_frame(frame, persist=False)
     associations = get_motorcycle_associations(detections)
 
+    # Map tracked persons to their motorcycles
     person_moto = {}
     for a in associations:
         mc_d = a["motorcycle"]
@@ -420,77 +418,75 @@ def process_image(image_bgr, detect_triple, detect_helmet, detect_signal,
             if rtid >= 0:
                 person_moto[rtid] = mc_d
 
+    # Track the FIRST (main/driver) rider for each motorcycle
+    main_rider_ids = set()
+    for a in associations:
+        riders = a.get("riders", [])
+        if riders:  # Get the first rider (driver)
+            first_rider_id = riders[0].get("track_id", -1)
+            if first_rider_id >= 0:
+                main_rider_ids.add(first_rider_id)
+
     results = []
 
     def plate_for(bbox):
-        return plate_detector.read_vehicle_plate(clean, bbox) or "UNKNOWN"
+        plate = plate_detector.read_vehicle_plate(clean, bbox)
+        return plate if plate and len(plate) >= 4 else "N/A"
 
     # ── Triple Riding ──
     if detect_triple:
+        for v in check_triple_riding(detections, frame_number=0):
+            riders_count = v.get("riders_count", 0)
+            if riders_count > 2:
+                ridx = log_violation("Triple Riding", vehicle_id=v.get("vehicle_id", -1),
+                                     location=location, riders_count=riders_count)
+                if ridx is not None:
+                    plate = plate_for(v["bbox"])
+                    update_vehicle_number(ridx, plate)
+                    results.append({"violation": "Triple Riding", "plate": plate, 
+                                    "riders": riders_count})
+            else:
+                results.append({"violation": f"Normal ({riders_count})", "plate": "N/A", 
+                                "riders": riders_count})
+        
         for kind, payload in classify_associations(associations):
             if kind == "triple":
                 frame = draw_triple_riding(frame, [payload])
             else:
                 frame = draw_normal_motorcycles(frame, [payload], set())
-        for v in check_triple_riding(detections, frame_number=0):
-            ridx = log_violation("Triple Riding", vehicle_id=v["vehicle_id"],
-                                 location=location, riders_count=v["riders_count"])
-            if ridx is not None:
-                plate = plate_for(v["bbox"])
-                if plate != "UNKNOWN":
-                    update_vehicle_number(ridx, plate)
-                results.append({"violation": "Triple Riding", "plate": plate,
-                                "riders": v["riders_count"]})
 
-    # ── Helmet ──
+    # ── Helmet (Main Rider Only) ──
     if detect_helmet:
-        persons = _dedupe_persons(
-            [d for d in detections if d["class"] == "person"])
-        for person in persons:
+        # Check helmet ONLY on the main/driver rider, not passengers
+        for main_rider_id in main_rider_ids:
+            # Find the person object from the original detections
+            person = next((d for d in detections if d.get("track_id") == main_rider_id), None)
+            if not person: continue
+            
             px1, py1, px2, py2 = map(int, person["bbox"])
-            if (py2 - py1) < 90:
-                continue
+            if (py2 - py1) < 90: continue
+            
             has_helmet = helmet_det.check_helmet(clean, (px1, py1, px2, py2))
-            if has_helmet is None:
-                continue
+            if has_helmet is None: continue
+            
+            # Draw UI
             bw, bh = px2 - px1, py2 - py1
             cx = (px1 + px2) // 2
             half_w = max(int(bw * 0.25), 10)
             hx1, hy1, hx2, hy2 = cx - half_w, py1, cx + half_w, py1 + int(bh * 0.28)
             color = (0, 200, 0) if has_helmet else (0, 0, 255)
-            label = "Helmet" if has_helmet else "No Helmet"
             cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), color, 3)
-            cv2.putText(frame, label, (hx1, max(hy1 - 6, 12)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            
+            # Log violation ONLY if no helmet detected
             if not has_helmet:
-                pid = person.get("track_id", -1)
-                ridx = log_violation("No Helmet", vehicle_id=pid, location=location)
+                mc_d = person_moto.get(main_rider_id)
+                ridx = log_violation("No Helmet", vehicle_id=main_rider_id, location=location)
                 if ridx is not None:
-                    mc_d = person_moto.get(pid)
-                    bbox = mc_d["bbox"] if mc_d else (
-                        px1, py1, px2, int(py2 + bh * 0.45))
-                    plate = plate_for(bbox)
-                    if plate != "UNKNOWN":
-                        update_vehicle_number(ridx, plate)
-                    results.append({"violation": "No Helmet", "plate": plate,
-                                    "riders": None})
-
-    # ── Signal Jump ──
-    if detect_signal:
-        h_f, w_f = frame.shape[:2]
-        red_line_y = int(h_f * 0.7)
-        cv2.line(frame, (0, red_line_y), (w_f, red_line_y), (0, 0, 255), 2)
-        for v in check_signal_jump(detections, red_line_y, is_red_signal=True):
-            vid = v.get("vehicle_id", -1)
-            ridx = log_violation("Signal Jumping", vehicle_id=vid, location=location)
-            if ridx is not None:
-                bbox = next((d["bbox"] for d in detections
-                             if d.get("track_id", -1) == vid
-                             and d["class"] == "motorcycle"), None)
-                plate = plate_for(bbox) if bbox else "UNKNOWN"
-                if plate != "UNKNOWN":
+                    if mc_d is not None:
+                        plate = plate_for(mc_d["bbox"])
+                    else:
+                        plate = "N/A"
                     update_vehicle_number(ridx, plate)
-                results.append({"violation": "Signal Jumping", "plate": plate,
-                                "riders": None})
+                    results.append({"violation": "No Helmet", "plate": plate, "riders": None})
 
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), results
